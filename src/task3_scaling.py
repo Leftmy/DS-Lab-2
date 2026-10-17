@@ -89,7 +89,8 @@ class ScalingAnalyzer:
                 transformed = pd.DataFrame(
                     transformed, columns=valid_columns, index=selected.index
                 ).mask(missing_values)
-                result.loc[:, valid_columns] = transformed
+                for column in valid_columns:
+                    result[column] = transformed[column]
                 self._scaler_columns[dataset_name] = valid_columns
             else:
                 self._scaler_columns[dataset_name] = []
@@ -428,7 +429,9 @@ class ScalingAnalyzer:
                 data_to_plot.append(scaled_df[feature].dropna())
                 labels.append(method_name.upper())
             
-            bp = ax.boxplot(data_to_plot, labels=labels, patch_artist=True)
+            bp = ax.boxplot(data_to_plot, patch_artist=True)
+            ax.set_xticks(range(1, len(labels) + 1))
+            ax.set_xticklabels(labels)
             
             # Color the boxes
             colors = ['skyblue'] + ['lightcoral'] * len(self.scaled_datasets)

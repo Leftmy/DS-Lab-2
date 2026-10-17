@@ -296,7 +296,9 @@ class OutlierAnalyzer:
         """
         result = self.data.copy()
         for column in self._get_numeric_data().columns:
-            values = result[column].to_numpy(dtype=float, na_value=np.nan)
+            values = result[column].to_numpy(
+                dtype=float, na_value=np.nan, copy=True
+            )
             finite = np.isfinite(values)
             if finite.sum() < 2 or np.all(values[finite] == values[finite][0]):
                 continue

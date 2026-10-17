@@ -454,7 +454,9 @@ class DataPreprocessor:
             imputer = SimpleImputer(strategy='median')
             imputed = imputer.fit_transform(finite_data)
             scaler = StandardScaler() if method == 'standard' else RobustScaler()
-            data.loc[:, numeric_cols] = scaler.fit_transform(imputed)
+            scaled = scaler.fit_transform(imputed)
+            for index, column in enumerate(numeric_cols):
+                data[column] = scaled[:, index]
         
         self.data = data
         self.preprocessing_steps.append(f"Feature scaling: {method}")
