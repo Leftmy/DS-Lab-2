@@ -23,8 +23,7 @@ from sklearn.impute import IterativeImputer
 from sklearn.feature_selection import SelectKBest, f_classif, mutual_info_classif
 from sklearn.decomposition import PCA
 from sklearn.utils import resample
-from scipy import stats
-from typing import Tuple, Dict, List, Optional, Any
+from typing import Tuple, Dict, List, Any
 from datetime import datetime, timedelta
 import warnings
 import json
@@ -52,6 +51,36 @@ class DataPreprocessor:
         self.preprocessed_data = None
         self.quality_report = {}
         self.preprocessing_steps = []
+
+    def _feature_columns(self) -> Tuple[List[str], List[str], List[str]]:
+        feature_data = self.data.drop(
+            columns=[self.target_col], errors='ignore'
+        )
+        datetime_cols = feature_data.select_dtypes(
+            include=['datetime', 'datetimetz']
+        ).columns.tolist()
+        for column in feature_data.select_dtypes(include=['object']).columns:
+            non_missing = feature_data[column].dropna()
+            if not non_missing.empty and non_missing.map(
+                lambda value: isinstance(value, (datetime, pd.Timestamp, np.datetime64))
+            ).all():
+                datetime_cols.append(column)
+            elif any(token in str(column).lower() for token in ('date', 'time')):
+                parsed = pd.to_datetime(non_missing, errors='coerce')
+                if not non_missing.empty and parsed.notna().mean() >= 0.9:
+                    datetime_cols.append(column)
+        numeric_cols = feature_data.select_dtypes(
+            include=[np.number]
+        ).columns.tolist()
+        categorical_cols = [
+            column for column in feature_data.columns
+            if column not in numeric_cols and column not in datetime_cols
+        ]
+        return numeric_cols, categorical_cols, datetime_cols
+
+    def _ensure_quality_report(self) -> None:
+        if not self.quality_report:
+            self.assess_data_quality()
         
     def assess_data_quality(self) -> Dict[str, Any]:
         """
@@ -64,8 +93,8 @@ class DataPreprocessor:
             'shape': self.data.shape,
             'total_samples': len(self.data),
             'total_features': len(self.data.columns),
-            'memory_usage_mb': self.data.memory_usage(deep=True).sum() / 1024**2,
-            'duplicates': self.data.duplicated().sum(),
+            'memory_usage_mb': float(self.data.memory_usage(deep=True).sum() / 1024**2),
+            'duplicates': int(self.data.duplicated().sum()),
             'missing_values': {},
             'data_types': {},
             'numeric_features': [],
@@ -74,19 +103,46 @@ class DataPreprocessor:
             'target_distribution': {}
         }
         
-        # Missing values analysis
-        pass
-        
-        # Data types
-        pass
-        
-        # Target distribution
-        pass
+        missing_by_column = self.data.isnull().sum()
+        missing_by_column = missing_by_column[missing_by_column > 0]
+        report['missing_values'] = {
+            'total': int(self.data.isnull().sum().sum()),
+            'by_column': missing_by_column.astype(int).to_dict(),
+            'percentage_by_column': (
+                (missing_by_column / len(self.data) * 100).to_dict()
+                if len(self.data) else {}
+            ),
+        }
+
+        numeric_cols, categorical_cols, datetime_cols = self._feature_columns()
+        report['numeric_features'] = numeric_cols
+        report['categorical_features'] = categorical_cols
+        report['datetime_features'] = datetime_cols
+        report['data_types'] = self.data.dtypes.astype(str).to_dict()
+        if self.target_col in self.data.columns:
+            target_counts = self.data[self.target_col].value_counts(dropna=False)
+            report['target_distribution'] = {
+                str(class_value): int(count)
+                for class_value, count in target_counts.items()
+            }
+            nonzero_counts = target_counts[target_counts > 0]
+            report['class_balance'] = (
+                float(nonzero_counts.min() / nonzero_counts.max())
+                if len(nonzero_counts) > 1 else 1.0
+            )
+        self.quality_report = report
+        return report
+
+    def print_quality_summary(self):
+        """Print the current data quality report using the README's method name."""
+        self._ensure_quality_report()
+        return self.print_quality_report()
     
     def print_quality_report(self):
         """
         Print formatted data quality report.
         """
+        self._ensure_quality_report()
         print("=" * 80)
         print("DATA QUALITY ASSESSMENT REPORT")
         print("=" * 80)
@@ -132,26 +188,83 @@ class DataPreprocessor:
         Returns:
             pd.DataFrame: Data with missing values handled
         """
+        self._ensure_quality_report()
+        if strategy not in {'auto', 'simple', 'knn', 'iterative'}:
+            raise ValueError("strategy must be 'auto', 'simple', 'knn', or 'iterative'.")
         data = self.data.copy()
-        
-        numeric_cols = [col for col in self.quality_report['numeric_features'] 
-                       if col != self.target_col]
-        categorical_cols = self.quality_report['categorical_features']
-        
-        if strategy == 'auto' or strategy == 'simple':
-            # Numeric: median imputation
-            pass
-            
-            # Categorical: mode imputation
-            if categorical_cols:
-                pass
-        
+        if self.target_col in data.columns and data[self.target_col].isna().any():
+            raise ValueError("Target column contains missing values; impute or remove targets separately.")
+        numeric_cols, categorical_cols, datetime_cols = self._feature_columns()
+        numeric_cols = [
+            column for column in numeric_cols if column != self.target_col
+        ]
+        data.loc[:, numeric_cols] = data[numeric_cols].replace(
+            [np.inf, -np.inf], np.nan
+        )
+        numeric_cols = [
+            column for column in numeric_cols
+            if data[column].notna().any()
+        ]
+        all_missing_numeric = [
+            column for column in data.select_dtypes(include=[np.number]).columns
+            if column != self.target_col and data[column].isna().all()
+        ]
+        data.loc[:, all_missing_numeric] = 0.0
+
+        if strategy in {'auto', 'simple'}:
+            if numeric_cols:
+                imputer = SimpleImputer(strategy='median')
+                data.loc[:, numeric_cols] = imputer.fit_transform(data[numeric_cols])
+            for column in categorical_cols:
+                missing = data[column].isna()
+                if missing.any():
+                    non_missing = data[column].dropna()
+                    fill_value = non_missing.mode().iloc[0] if not non_missing.empty else 'Missing'
+                    data.loc[missing, column] = fill_value
+            for column in datetime_cols:
+                if data[column].isna().any():
+                    non_missing = data[column].dropna()
+                    if not non_missing.empty:
+                        data[column] = data[column].fillna(non_missing.mode().iloc[0])
+                    else:
+                        data[column] = pd.Timestamp('1970-01-01')
+
         elif strategy == 'knn':
-            pass
-        
+            if numeric_cols:
+                imputer = KNNImputer(n_neighbors=min(5, max(1, len(data) - 1)))
+                data.loc[:, numeric_cols] = imputer.fit_transform(data[numeric_cols])
+            for column in categorical_cols:
+                missing = data[column].isna()
+                if missing.any():
+                    non_missing = data[column].dropna()
+                    fill_value = non_missing.mode().iloc[0] if not non_missing.empty else 'Missing'
+                    data.loc[missing, column] = fill_value
+            for column in datetime_cols:
+                if data[column].isna().any():
+                    non_missing = data[column].dropna()
+                    if not non_missing.empty:
+                        data[column] = data[column].fillna(non_missing.mode().iloc[0])
+                    else:
+                        data[column] = pd.Timestamp('1970-01-01')
+
         elif strategy == 'iterative':
-            pass
-        
+            if numeric_cols:
+                imputer = IterativeImputer(max_iter=10, random_state=42)
+                data.loc[:, numeric_cols] = imputer.fit_transform(data[numeric_cols])
+            for column in categorical_cols:
+                missing = data[column].isna()
+                if missing.any():
+                    non_missing = data[column].dropna()
+                    fill_value = non_missing.mode().iloc[0] if not non_missing.empty else 'Missing'
+                    data.loc[missing, column] = fill_value
+            for column in datetime_cols:
+                if data[column].isna().any():
+                    non_missing = data[column].dropna()
+                    if not non_missing.empty:
+                        data[column] = data[column].fillna(non_missing.mode().iloc[0])
+                    else:
+                        data[column] = pd.Timestamp('1970-01-01')
+
         self.data = data
         self.preprocessing_steps.append(f"Missing values handled: {strategy}")
         return data
@@ -168,10 +281,55 @@ class DataPreprocessor:
         Returns:
             pd.DataFrame: Data with outliers handled
         """
+        self._ensure_quality_report()
+        if method not in {'iqr', 'zscore'}:
+            raise ValueError("method must be 'iqr' or 'zscore'.")
+        if action not in {'cap', 'remove'}:
+            raise ValueError("action must be 'cap' or 'remove'.")
         data = self.data.copy()
-                                       
-        pass
-        
+        numeric_cols = [
+            column for column in data.select_dtypes(include=[np.number]).columns
+            if column != self.target_col
+        ]
+        outlier_mask = pd.DataFrame(False, index=data.index, columns=numeric_cols)
+        if method == 'iqr':
+            for column in numeric_cols:
+                values = data[column].replace([np.inf, -np.inf], np.nan)
+                q1, q3 = values.quantile([0.25, 0.75])
+                spread = q3 - q1
+                lower, upper = q1 - 1.5 * spread, q3 + 1.5 * spread
+                outlier_mask[column] = (
+                    data[column].lt(lower) | data[column].gt(upper)
+                    | ~np.isfinite(data[column])
+                ).fillna(False)
+        else:
+            for column in numeric_cols:
+                values = data[column].replace([np.inf, -np.inf], np.nan)
+                mean, std = values.mean(), values.std(ddof=0)
+                if pd.isna(std) or std == 0:
+                    outlier_mask[column] = ~np.isfinite(data[column])
+                else:
+                    outlier_mask[column] = (
+                        ((data[column] - mean).abs() > 3.0 * std)
+                        | ~np.isfinite(data[column])
+                    ).fillna(False)
+
+        outliers_count = int(outlier_mask.any(axis=1).sum()) if numeric_cols else 0
+        if action == 'cap':
+            for column in numeric_cols:
+                values = data[column].replace([np.inf, -np.inf], np.nan)
+                if method == 'iqr':
+                    q1, q3 = values.quantile([0.25, 0.75])
+                    spread = q3 - q1
+                    lower, upper = q1 - 1.5 * spread, q3 + 1.5 * spread
+                else:
+                    mean, std = values.mean(), values.std(ddof=0)
+                    lower, upper = mean - 3.0 * std, mean + 3.0 * std
+                if pd.notna(lower) and pd.notna(upper):
+                    data[column] = values.clip(lower=lower, upper=upper)
+        elif action == 'remove' and numeric_cols:
+            data = data.loc[~outlier_mask.any(axis=1)].copy()
+
         self.data = data
         self.preprocessing_steps.append(
             f"Outliers handled: {method} method, {action} action, {outliers_count} outliers"
@@ -188,10 +346,40 @@ class DataPreprocessor:
         Returns:
             pd.DataFrame: Data with encoded categorical features
         """
+        if method not in {'auto', 'onehot', 'label'}:
+            raise ValueError("method must be 'auto', 'onehot', or 'label'.")
         data = self.data.copy()
-        
-        pass
-        
+        _, _, datetime_cols = self._feature_columns()
+        for column in datetime_cols:
+            if column == self.target_col:
+                continue
+            dates = pd.to_datetime(data[column], errors='coerce')
+            data[f'{column}_year'] = dates.dt.year
+            data[f'{column}_month'] = dates.dt.month
+            data[f'{column}_day'] = dates.dt.day
+            data[f'{column}_dayofweek'] = dates.dt.dayofweek
+            data = data.drop(columns=[column])
+
+        categorical_cols = [
+            column for column in data.select_dtypes(include=['object', 'category', 'bool']).columns
+            if column != self.target_col
+        ]
+        for column in categorical_cols:
+            values = data[column].astype('object').where(data[column].notna(), 'Missing').astype(str)
+            cardinality = values.nunique()
+            selected_method = (
+                'onehot' if method == 'auto' and cardinality <= 10
+                else 'label' if method == 'auto'
+                else method
+            )
+            if selected_method == 'onehot':
+                encoded = pd.get_dummies(values, prefix=column, dtype=int)
+                data = data.drop(columns=[column]).join(encoded)
+            else:
+                encoder = LabelEncoder()
+                data[f'{column}_encoded'] = encoder.fit_transform(values)
+                data = data.drop(columns=[column])
+
         self.data = data
         self.preprocessing_steps.append(f"Categorical encoding: {method}, datetime features extracted")
         return data
@@ -207,24 +395,36 @@ class DataPreprocessor:
             pd.DataFrame: Data with engineered features
         """
         data = self.data.copy()
-        numeric_cols = [col for col in self.quality_report['numeric_features'] 
-                       if col != self.target_col]
+        numeric_cols = [
+            col for col in data.select_dtypes(include=[np.number]).columns
+            if col != self.target_col
+        ]
         
         new_features = []
         
         # Statistical features
         if len(numeric_cols) >= 2:
-            # Mean of all numeric features
-            pass
-            
-            # Standard deviation
-            pass
-            
-            # Min and max
-            pass
+            numeric_data = data[numeric_cols]
+            data['mean_all_features'] = numeric_data.mean(axis=1)
+            data['std_all_features'] = numeric_data.std(axis=1)
+            data['min_all_features'] = numeric_data.min(axis=1)
+            data['max_all_features'] = numeric_data.max(axis=1)
+            new_features.extend([
+                'mean_all_features', 'std_all_features',
+                'min_all_features', 'max_all_features',
+            ])
         
         # Interaction features (limited to avoid explosion)
-        pass
+        if domain_features and len(numeric_cols) >= 2:
+            for first, second in zip(numeric_cols[:3], numeric_cols[1:4]):
+                product_name = f'{first}_x_{second}'
+                ratio_name = f'{first}_ratio_{second}'
+                data[product_name] = data[first] * data[second]
+                denominator = data[second].replace(0, np.nan)
+                data[ratio_name] = (data[first] / denominator).replace(
+                    [np.inf, -np.inf], np.nan
+                ).fillna(0.0)
+                new_features.extend([product_name, ratio_name])
         
         self.data = data
         self.preprocessing_steps.append(f"Feature engineering: {len(new_features)} new features created")
@@ -240,9 +440,21 @@ class DataPreprocessor:
         Returns:
             pd.DataFrame: Data with scaled features
         """
+        if method not in {'standard', 'robust'}:
+            raise ValueError("method must be 'standard' or 'robust'.")
         data = self.data.copy()
-        
-        pass
+        numeric_cols = [
+            column for column in data.select_dtypes(include=[np.number]).columns
+            if column != self.target_col
+        ]
+        if numeric_cols:
+            finite_data = data[numeric_cols].replace([np.inf, -np.inf], np.nan)
+            empty_columns = finite_data.columns[finite_data.isna().all()].tolist()
+            finite_data.loc[:, empty_columns] = 0.0
+            imputer = SimpleImputer(strategy='median')
+            imputed = imputer.fit_transform(finite_data)
+            scaler = StandardScaler() if method == 'standard' else RobustScaler()
+            data.loc[:, numeric_cols] = scaler.fit_transform(imputed)
         
         self.data = data
         self.preprocessing_steps.append(f"Feature scaling: {method}")
@@ -263,25 +475,43 @@ class DataPreprocessor:
         
         if self.target_col not in data.columns:
             return data
-        
+        if n_features < 1:
+            raise ValueError("n_features must be at least 1.")
+        if method not in {'kbest', 'mutual_info'}:
+            raise ValueError("method must be 'kbest' or 'mutual_info'.")
+
         X = data.drop(columns=[self.target_col])
         y = data[self.target_col]
-        
-        # Ensure we don't select more features than available
+        numeric_cols = X.select_dtypes(include=[np.number]).columns.tolist()
+        if not numeric_cols:
+            raise ValueError("Feature selection requires numeric feature columns.")
+        X = X[numeric_cols].replace([np.inf, -np.inf], np.nan)
+        nonempty_cols = X.columns[X.notna().any()].tolist()
+        if not nonempty_cols:
+            raise ValueError("Feature selection requires at least one non-empty feature.")
+        X = X[nonempty_cols].fillna(X[nonempty_cols].median()).fillna(0.0)
+        valid_target = y.notna()
+        X = X.loc[valid_target]
+        y = y.loc[valid_target]
+        if y.nunique() < 2:
+            raise ValueError("Feature selection requires at least two target classes.")
         n_features = min(n_features, X.shape[1])
-        
+
         if method == 'kbest':
             selector = SelectKBest(score_func=f_classif, k=n_features)
         elif method == 'mutual_info':
-            selector = SelectKBest(score_func=mutual_info_classif, k=n_features)
-        else:
-            return data
+            selector = SelectKBest(
+                score_func=lambda features, target: mutual_info_classif(
+                    features, target, random_state=42
+                ),
+                k=n_features,
+            )
         
-        X_selected = selector.fit_transform(X, y)
+        selector.fit(X, y)
         selected_features = X.columns[selector.get_support()].tolist()
         
-        data = pd.DataFrame(X_selected, columns=selected_features)
-        data[self.target_col] = y.values
+        data = data.loc[valid_target, selected_features].copy()
+        data[self.target_col] = y
         
         self.data = data
         self.preprocessing_steps.append(
@@ -303,34 +533,30 @@ class DataPreprocessor:
         
         if self.target_col not in data.columns:
             return data
-        
-        # Separate majority and minority classes
+        if method not in {'undersample', 'oversample'}:
+            raise ValueError("method must be 'undersample' or 'oversample'.")
+        if data[self.target_col].isna().any():
+            raise ValueError("Class balancing requires non-missing target values.")
         class_counts = data[self.target_col].value_counts()
-        majority_class = class_counts.idxmax()
-        minority_class = class_counts.idxmin()
-        
-        df_majority = data[data[self.target_col] == majority_class]
-        df_minority = data[data[self.target_col] == minority_class]
-        
+        if len(class_counts) < 2:
+            raise ValueError("Class balancing requires at least two target classes.")
+        target_count = int(class_counts.min() if method == 'undersample' else class_counts.max())
+        class_frames = [
+            data.loc[data[self.target_col] == class_value]
+            for class_value in class_counts.index
+        ]
+
         if method == 'undersample':
-            # Downsample majority class
-            df_majority_downsampled = resample(
-                df_majority, 
-                replace=False,
-                n_samples=len(df_minority),
-                random_state=42
-            )
-            data = pd.concat([df_majority_downsampled, df_minority])
-        
-        elif method == 'oversample':
-            # Upsample minority class
-            df_minority_upsampled = resample(
-                df_minority,
-                replace=True,
-                n_samples=len(df_majority),
-                random_state=42
-            )
-            data = pd.concat([df_majority, df_minority_upsampled])
+            balanced_frames = [
+                resample(frame, replace=False, n_samples=target_count, random_state=42)
+                for frame in class_frames
+            ]
+        else:
+            balanced_frames = [
+                resample(frame, replace=True, n_samples=target_count, random_state=42)
+                for frame in class_frames
+            ]
+        data = pd.concat(balanced_frames).sample(frac=1, random_state=42)
         
         self.data = data
         self.preprocessing_steps.append(f"Class balancing: {method}")
@@ -346,6 +572,9 @@ class DataPreprocessor:
         Returns:
             pd.DataFrame: Fully preprocessed data
         """
+        if not isinstance(config, dict):
+            raise TypeError("config must be a dictionary.")
+        self._ensure_quality_report()
         print("Starting preprocessing pipeline...")
         print("-" * 80)
         
@@ -381,7 +610,10 @@ class DataPreprocessor:
         if config.get('select_features', False):
             print("Step 6: Selecting features...")
             self.data = self.select_features(
-                method=config.get('selection_method', 'kbest'),
+                method=config.get(
+                    'feature_selection_method',
+                    config.get('selection_method', 'kbest'),
+                ),
                 n_features=config.get('n_features', 20)
             )
         
@@ -408,13 +640,10 @@ class DataPreprocessor:
         Returns:
             matplotlib.figure.Figure: The generated figure
         """
-        numeric_cols = [col for col in self.quality_report['numeric_features'] 
-                       if col != self.target_col]
-        categorical_cols = self.quality_report['categorical_features']
+        self._ensure_quality_report()
+        numeric_cols, categorical_cols, _ = self._feature_columns()
         
         # Create subplot grid
-        n_numeric = min(len(numeric_cols), 6)
-        n_categorical = min(len(categorical_cols), 3)
         n_rows = 3
         n_cols = 3
         
@@ -460,6 +689,8 @@ class DataPreprocessor:
             matplotlib.figure.Figure: The generated figure
         """
         numeric_data = self.original_data.select_dtypes(include=[np.number])
+        numeric_data = numeric_data.replace([np.inf, -np.inf], np.nan)
+        numeric_data = numeric_data.dropna(axis=1, how='all')
         
         # Limit to reasonable number of features
         if numeric_data.shape[1] > 20:
@@ -467,9 +698,13 @@ class DataPreprocessor:
         
         fig, ax = plt.subplots(figsize=figsize)
         
-        corr_matrix = numeric_data.corr()
-        sns.heatmap(corr_matrix, annot=True, fmt='.2f', cmap='coolwarm', 
-                   center=0, square=True, ax=ax, cbar_kws={'label': 'Correlation'})
+        if numeric_data.empty:
+            ax.text(0.5, 0.5, 'No numeric features available', ha='center', va='center')
+            ax.axis('off')
+        else:
+            corr_matrix = numeric_data.corr()
+            sns.heatmap(corr_matrix, annot=True, fmt='.2f', cmap='coolwarm', 
+                       center=0, square=True, ax=ax, cbar_kws={'label': 'Correlation'})
         
         ax.set_title('Feature Correlation Matrix', fontweight='bold', pad=20, fontsize=14)
         plt.tight_layout()
@@ -534,12 +769,24 @@ class DataPreprocessor:
         """
         if self.target_col not in self.data.columns:
             raise ValueError("Target column not found")
-        
-        X = self.data.drop(columns=[self.target_col])
+        if n_components < 2:
+            raise ValueError("n_components must be at least 2 for a 2D PCA plot.")
+
+        X = self.data.drop(columns=[self.target_col]).select_dtypes(include=[np.number])
         y = self.data[self.target_col]
-        
-        pca = PCA(n_components=n_components)
-        X_pca = pca.fit_transform(X)
+        X = X.replace([np.inf, -np.inf], np.nan).dropna(axis=1, how='all')
+        if X.empty:
+            raise ValueError("PCA requires at least one non-empty numeric feature.")
+        X = X.fillna(X.median()).fillna(0.0)
+        actual_components = min(n_components, X.shape[1], X.shape[0])
+        pca = PCA(n_components=actual_components)
+        transformed = pca.fit_transform(X)
+        if actual_components == 1:
+            X_pca = np.column_stack([transformed[:, 0], np.zeros(len(transformed))])
+            variance = np.array([pca.explained_variance_ratio_[0], 0.0])
+        else:
+            X_pca = transformed[:, :2]
+            variance = pca.explained_variance_ratio_[:2]
         
         fig, ax = plt.subplots(figsize=figsize)
         
@@ -549,9 +796,9 @@ class DataPreprocessor:
             ax.scatter(X_pca[mask, 0], X_pca[mask, 1], 
                       label=f'Class {class_val}', alpha=0.6, s=50)
         
-        ax.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.2%} variance)', 
+        ax.set_xlabel(f'PC1 ({variance[0]:.2%} variance)', 
                      fontweight='bold')
-        ax.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.2%} variance)', 
+        ax.set_ylabel(f'PC2 ({variance[1]:.2%} variance)', 
                      fontweight='bold')
         ax.set_title('PCA - Feature Space Visualization', fontweight='bold', 
                     pad=20, fontsize=14)
@@ -579,6 +826,7 @@ class DataPreprocessor:
             json.dump(report, f, indent=2, default=str)
         
         print(f"Report saved to {filepath}")
+        return report
 
 
 def create_complex_synthetic_dataset(n_samples: int = 2000,
@@ -601,6 +849,17 @@ def create_complex_synthetic_dataset(n_samples: int = 2000,
     Returns:
         pd.DataFrame: Complex synthetic dataset
     """
+    if n_samples < 2:
+        raise ValueError("n_samples must be at least 2.")
+    if n_features < 3:
+        raise ValueError("n_features must be at least 3.")
+    if not np.isfinite(missing_rate) or not 0 <= missing_rate <= 1:
+        raise ValueError("missing_rate must be between 0 and 1.")
+    if not np.isfinite(outlier_rate) or not 0 <= outlier_rate <= 1:
+        raise ValueError("outlier_rate must be between 0 and 1.")
+    if not np.isfinite(imbalance_ratio) or not 0 < imbalance_ratio < 1:
+        raise ValueError("imbalance_ratio must be between 0 and 1.")
+
     np.random.seed(random_state)
     
     # Generate numerical features

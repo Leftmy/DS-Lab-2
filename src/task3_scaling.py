@@ -20,15 +20,15 @@ from sklearn.preprocessing import (
     MinMaxScaler, StandardScaler, RobustScaler, 
     MaxAbsScaler, PowerTransformer
 )
-from sklearn.linear_model import LinearRegression, SGDRegressor
-from sklearn.neighbors import KNeighborsClassifier
+from sklearn.linear_model import LinearRegression
+from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
 from sklearn.svm import SVC
 from sklearn.neural_network import MLPClassifier
-from sklearn.model_selection import cross_val_score, learning_curve
-from sklearn.datasets import make_classification
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import make_pipeline
+from sklearn.model_selection import cross_val_score, StratifiedKFold, KFold
 from typing import Tuple, Dict, List
 import warnings
-from mpl_toolkits.mplot3d import Axes3D
 
 warnings.filterwarnings('ignore')
 
@@ -62,6 +62,42 @@ class ScalingAnalyzer:
         self.target_col = target_col
         self.scaled_datasets = {}
         self.scalers = {}
+        self._scaler_columns = {}
+
+    def _feature_columns(self) -> List[str]:
+        return [
+            column for column in self.data.select_dtypes(include=[np.number]).columns
+            if column != self.target_col
+        ]
+
+    def _apply_scaler(self, scaler, dataset_name: str) -> pd.DataFrame:
+        result = self.data.copy()
+        feature_columns = self._feature_columns()
+        if feature_columns:
+            features = self.data[feature_columns].replace([np.inf, -np.inf], np.nan)
+            valid_columns = features.columns[features.notna().any()].tolist()
+            if valid_columns:
+                selected = features[valid_columns]
+                missing_values = selected.isna()
+                imputer = SimpleImputer(strategy='median')
+                prepared = pd.DataFrame(
+                    imputer.fit_transform(selected),
+                    columns=valid_columns,
+                    index=selected.index,
+                )
+                transformed = scaler.fit_transform(prepared)
+                transformed = pd.DataFrame(
+                    transformed, columns=valid_columns, index=selected.index
+                ).mask(missing_values)
+                result.loc[:, valid_columns] = transformed
+                self._scaler_columns[dataset_name] = valid_columns
+            else:
+                self._scaler_columns[dataset_name] = []
+        else:
+            self._scaler_columns[dataset_name] = []
+        self.scalers[dataset_name] = scaler
+        self.scaled_datasets[dataset_name] = result.copy()
+        return result.copy()
         
     def apply_minmax_scaling(self, feature_range: Tuple[float, float] = (0, 1)) -> pd.DataFrame:
         """
@@ -73,7 +109,8 @@ class ScalingAnalyzer:
         Returns:
             pd.DataFrame: DataFrame with features scaled to specified range.
         """
-        pass
+        scaler = MinMaxScaler(feature_range=feature_range)
+        return self._apply_scaler(scaler, 'minmax')
     
     def apply_standard_scaling(self) -> pd.DataFrame:
         """
@@ -82,7 +119,7 @@ class ScalingAnalyzer:
         Returns:
             pd.DataFrame: DataFrame with standardized features.
         """
-        pass
+        return self._apply_scaler(StandardScaler(), 'standard')
     
     def apply_robust_scaling(self) -> pd.DataFrame:
         """
@@ -91,7 +128,7 @@ class ScalingAnalyzer:
         Returns:
             pd.DataFrame: DataFrame with robust scaled features.
         """
-        pass
+        return self._apply_scaler(RobustScaler(), 'robust')
     
     def apply_maxabs_scaling(self) -> pd.DataFrame:
         """
@@ -100,7 +137,7 @@ class ScalingAnalyzer:
         Returns:
             pd.DataFrame: DataFrame with maxabs scaled features.
         """
-        pass
+        return self._apply_scaler(MaxAbsScaler(), 'maxabs')
     
     def apply_power_transform(self, method: str = 'yeo-johnson') -> pd.DataFrame:
         """
@@ -112,7 +149,39 @@ class ScalingAnalyzer:
         Returns:
             pd.DataFrame: DataFrame with power transformed and standardized features.
         """
-        pass
+        method_aliases = {'box-cox': 'box-cox', 'boxcox': 'box-cox', 'yeo-johnson': 'yeo-johnson', 'yeo_johnson': 'yeo-johnson'}
+        if method not in method_aliases:
+            raise ValueError("method must be 'yeo-johnson' or 'box-cox'.")
+
+        feature_columns = self._feature_columns()
+        features = self.data[feature_columns].replace([np.inf, -np.inf], np.nan)
+        valid_columns = features.columns[features.notna().any()].tolist()
+        if valid_columns:
+            selected = features[valid_columns]
+            missing_values = selected.isna()
+            imputer = SimpleImputer(strategy='median')
+            prepared = pd.DataFrame(
+                imputer.fit_transform(selected),
+                columns=valid_columns,
+                index=selected.index,
+            )
+            if method_aliases[method] == 'box-cox' and (prepared <= 0).any():
+                raise ValueError("Box-Cox transformation requires all feature values to be positive.")
+            scaler = PowerTransformer(method=method_aliases[method])
+            transformed = pd.DataFrame(
+                scaler.fit_transform(prepared),
+                columns=valid_columns,
+                index=selected.index,
+            ).mask(missing_values)
+            result = self.data.copy()
+            result.loc[:, valid_columns] = transformed
+        else:
+            scaler = PowerTransformer(method=method_aliases[method])
+            result = self.data.copy()
+        self.scalers['power'] = scaler
+        self._scaler_columns['power'] = valid_columns
+        self.scaled_datasets['power'] = result.copy()
+        return result.copy()
     
     def get_scaling_summary(self) -> pd.DataFrame:
         """
@@ -121,7 +190,19 @@ class ScalingAnalyzer:
         Returns:
             DataFrame with statistics for each scaling method
         """
-        pass
+        datasets = {'original': self.original_data, **self.scaled_datasets}
+        summaries = {}
+        for name, dataset in datasets.items():
+            columns = [
+                column for column in dataset.select_dtypes(include=[np.number]).columns
+                if column != self.target_col
+            ]
+            if columns:
+                stats = dataset[columns].agg(['mean', 'std', 'min', 'max'])
+            else:
+                stats = pd.DataFrame(index=['mean', 'std', 'min', 'max'])
+            summaries[name] = stats
+        return pd.concat(summaries, axis=1)
     
     def evaluate_model_performance(self, model_type: str = 'linear_regression',
                                    dataset_name: str = 'original') -> Dict[str, float]:
@@ -135,7 +216,99 @@ class ScalingAnalyzer:
         Returns:
             Dict[str, float]: Dictionary containing cv_score and cv_std.
         """
-        pass
+        datasets = {'original': self.original_data, **self.scaled_datasets}
+        if dataset_name not in datasets:
+            raise ValueError(f"Dataset '{dataset_name}' is not available.")
+        dataset = datasets[dataset_name]
+        if self.target_col is not None:
+            target_column = self.target_col
+        else:
+            numeric_columns = dataset.select_dtypes(include=[np.number]).columns
+            if len(numeric_columns) < 2:
+                raise ValueError("A target column must be specified or inferable from the data.")
+            target_column = numeric_columns[-1]
+        if target_column not in dataset.columns:
+            raise ValueError(f"Target column '{target_column}' not found in dataset.")
+
+        feature_columns = [
+            column for column in dataset.select_dtypes(include=[np.number]).columns
+            if column != target_column
+        ]
+        if not feature_columns:
+            raise ValueError("At least one numeric predictor is required.")
+        model_data = dataset[feature_columns + [target_column]].replace(
+            [np.inf, -np.inf], np.nan
+        ).dropna(subset=[target_column])
+        feature_columns = [
+            column for column in feature_columns if model_data[column].notna().any()
+        ]
+        if not feature_columns:
+            raise ValueError("At least one numeric predictor with non-missing values is required.")
+        if len(model_data) < 4:
+            raise ValueError("At least four rows with a target value are required for cross-validation.")
+        features = model_data[feature_columns]
+        target = model_data[target_column]
+        classification = (
+            pd.api.types.is_object_dtype(target)
+            or pd.api.types.is_bool_dtype(target)
+            or target.nunique() <= 20
+        )
+
+        normalized_model = model_type.lower()
+        if normalized_model == 'linear_regression':
+            estimator = LinearRegression()
+            scoring = 'r2'
+            splitter = KFold(n_splits=min(5, len(model_data) // 2), shuffle=True, random_state=42)
+        elif normalized_model == 'knn':
+            if classification:
+                counts = target.value_counts()
+                if target.nunique() < 2:
+                    raise ValueError("KNN classification requires at least two target classes.")
+                n_splits = min(5, int(counts.min()))
+                if n_splits < 2:
+                    raise ValueError("Each target class must have at least two rows for cross-validation.")
+                splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+                smallest_train_fold = len(model_data) - int(np.ceil(len(model_data) / n_splits))
+                estimator = KNeighborsClassifier(n_neighbors=min(5, smallest_train_fold))
+                scoring = 'accuracy'
+            else:
+                n_splits = min(5, len(model_data) // 2)
+                splitter = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+                smallest_train_fold = len(model_data) - int(np.ceil(len(model_data) / n_splits))
+                estimator = KNeighborsRegressor(n_neighbors=min(5, smallest_train_fold))
+                scoring = 'r2'
+        elif normalized_model in {'svm', 'svc'}:
+            if not classification:
+                raise ValueError("SVM evaluation currently requires a categorical target.")
+            counts = target.value_counts()
+            n_splits = min(5, int(counts.min()))
+            if n_splits < 2:
+                raise ValueError("Each target class must have at least two rows for cross-validation.")
+            splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+            estimator = SVC()
+            scoring = 'accuracy'
+        elif normalized_model in {'neural_network', 'mlp'}:
+            if not classification:
+                raise ValueError("Neural network evaluation currently requires a categorical target.")
+            counts = target.value_counts()
+            n_splits = min(5, int(counts.min()))
+            if n_splits < 2:
+                raise ValueError("Each target class must have at least two rows for cross-validation.")
+            splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+            estimator = MLPClassifier(
+                hidden_layer_sizes=(50,), max_iter=500, random_state=42
+            )
+            scoring = 'accuracy'
+        else:
+            raise ValueError(
+                "Unsupported model_type. Choose linear_regression, knn, svm, or neural_network."
+            )
+
+        model = make_pipeline(SimpleImputer(strategy='median'), estimator)
+        scores = cross_val_score(
+            model, features, target, cv=splitter, scoring=scoring, error_score='raise'
+        )
+        return {'cv_score': float(scores.mean()), 'cv_std': float(scores.std())}
     
     def compare_model_performance(self, model_types: List[str] = None) -> pd.DataFrame:
         """
@@ -372,18 +545,30 @@ class ScalingAnalyzer:
         if x_feature not in self.data.columns or y_feature not in self.data.columns:
             print(f"Features '{x_feature}' or '{y_feature}' not found")
             return
-        
+        if not pd.api.types.is_numeric_dtype(self.data[x_feature]) or not pd.api.types.is_numeric_dtype(self.data[y_feature]):
+            print("Feature-space axes must be numeric")
+            return
+
         n_methods = min(3, len(self.scaled_datasets) + 1)
         fig, axes = plt.subplots(1, n_methods, figsize=figsize)
         if n_methods == 1:
             axes = [axes]
+
+        target_colors = None
+        if self.target_col and self.target_col in self.original_data.columns:
+            target = self.original_data[self.target_col]
+            target_colors = (
+                pd.to_numeric(target, errors='coerce')
+                if pd.api.types.is_numeric_dtype(target)
+                else pd.Series(pd.Categorical(target).codes, index=target.index)
+            )
         
         # Original data
         ax = axes[0]
-        if self.target_col and self.target_col in self.data.columns:
+        if target_colors is not None:
             scatter = ax.scatter(self.original_data[x_feature], 
                                self.original_data[y_feature],
-                               c=self.original_data[self.target_col],
+                               c=target_colors,
                                cmap='viridis', alpha=0.6)
             plt.colorbar(scatter, ax=ax)
         else:
@@ -398,10 +583,10 @@ class ScalingAnalyzer:
         # Scaled data
         for idx, (method_name, scaled_df) in enumerate(list(self.scaled_datasets.items())[:n_methods-1], start=1):
             ax = axes[idx]
-            if self.target_col and self.target_col in scaled_df.columns:
+            if target_colors is not None:
                 scatter = ax.scatter(scaled_df[x_feature], 
                                    scaled_df[y_feature],
-                                   c=scaled_df[self.target_col],
+                                   c=target_colors,
                                    cmap='viridis', alpha=0.6)
                 plt.colorbar(scatter, ax=ax)
             else:
@@ -427,18 +612,35 @@ class ScalingAnalyzer:
             x_feature, y_feature, z_feature: Features for 3D axes
             figsize: Figure size for plots
         """
+        features = [x_feature, y_feature, z_feature]
+        missing = [feature for feature in features if feature not in self.data.columns]
+        if missing:
+            print(f"Feature '{missing[0]}' not found")
+            return
+        if any(not pd.api.types.is_numeric_dtype(self.data[feature]) for feature in features):
+            print("Feature-space axes must be numeric")
+            return
+
         fig = plt.figure(figsize=figsize)
-        
+
         n_methods = min(3, len(self.scaled_datasets) + 1)
+        target_colors = None
+        if self.target_col and self.target_col in self.original_data.columns:
+            target = self.original_data[self.target_col]
+            target_colors = (
+                pd.to_numeric(target, errors='coerce')
+                if pd.api.types.is_numeric_dtype(target)
+                else pd.Series(pd.Categorical(target).codes, index=target.index)
+            )
         
         # Original data
         ax = fig.add_subplot(1, n_methods, 1, projection='3d')
-        if self.target_col and self.target_col in self.data.columns:
-            scatter = ax.scatter(self.original_data[x_feature],
-                               self.original_data[y_feature],
-                               self.original_data[z_feature],
-                               c=self.original_data[self.target_col],
-                               cmap='viridis', alpha=0.6)
+        if target_colors is not None:
+            ax.scatter(self.original_data[x_feature],
+                       self.original_data[y_feature],
+                       self.original_data[z_feature],
+                       c=target_colors,
+                       cmap='viridis', alpha=0.6)
         else:
             ax.scatter(self.original_data[x_feature],
                       self.original_data[y_feature],
@@ -452,12 +654,12 @@ class ScalingAnalyzer:
         # Scaled data
         for idx, (method_name, scaled_df) in enumerate(list(self.scaled_datasets.items())[:n_methods-1], start=2):
             ax = fig.add_subplot(1, n_methods, idx, projection='3d')
-            if self.target_col and self.target_col in scaled_df.columns:
-                scatter = ax.scatter(scaled_df[x_feature],
-                                   scaled_df[y_feature],
-                                   scaled_df[z_feature],
-                                   c=scaled_df[self.target_col],
-                                   cmap='viridis', alpha=0.6)
+            if target_colors is not None:
+                ax.scatter(scaled_df[x_feature],
+                           scaled_df[y_feature],
+                           scaled_df[z_feature],
+                           c=target_colors,
+                           cmap='viridis', alpha=0.6)
             else:
                 ax.scatter(scaled_df[x_feature],
                           scaled_df[y_feature],

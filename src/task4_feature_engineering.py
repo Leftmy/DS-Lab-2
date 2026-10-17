@@ -12,15 +12,18 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.preprocessing import (
-    OneHotEncoder, LabelEncoder, PolynomialFeatures, StandardScaler
+    LabelEncoder, PolynomialFeatures, StandardScaler
 )
 from sklearn.feature_selection import (
-    SelectKBest, f_classif, mutual_info_classif, RFE
+    SelectKBest, f_classif, RFE
 )
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split, cross_val_score
-from sklearn.linear_model import LogisticRegression
-from typing import List, Dict, Tuple, Optional, Union
+from sklearn.model_selection import cross_val_score
+from sklearn.linear_model import LinearRegression, LogisticRegression
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import make_pipeline
+from sklearn.model_selection import StratifiedKFold
+from typing import List, Dict, Tuple, Optional
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -46,6 +49,15 @@ class FeatureEngineeringPipeline:
         self.original_features = []
         self.engineered_features = []
         self.feature_importance_scores = {}
+
+    def _record_feature(self, name: str, description: str) -> None:
+        if name not in self.engineered_features:
+            self.engineered_features.append(name)
+        self.feature_catalog[name] = description
+
+    @staticmethod
+    def _category_key(value):
+        return '<MISSING>' if pd.isna(value) else value
         
     def create_mathematical_features(
         self,
@@ -70,7 +82,46 @@ class FeatureEngineeringPipeline:
         pd.DataFrame
             Dataframe with added mathematical features
         """
-        pass
+        valid_operations = {'log', 'sqrt', 'square', 'cube', 'reciprocal'}
+        unknown_operations = set(operations) - valid_operations
+        if unknown_operations:
+            raise ValueError(f"Unsupported mathematical operation(s): {sorted(unknown_operations)}")
+
+        result = df.copy()
+        for column in columns:
+            if column not in df.columns or not pd.api.types.is_numeric_dtype(df[column]):
+                continue
+            values = pd.to_numeric(df[column], errors='coerce').astype(float)
+            finite_values = values[np.isfinite(values)]
+            shift = max(0.0, -float(finite_values.min())) if not finite_values.empty else 0.0
+            for operation in operations:
+                feature_name = f'{column}_{operation}'
+                if operation == 'log':
+                    transformed = np.log1p(values + shift)
+                elif operation == 'sqrt':
+                    transformed = np.sqrt(values + shift)
+                elif operation == 'square':
+                    transformed = values ** 2
+                elif operation == 'cube':
+                    transformed = values ** 3
+                else:
+                    denominator = values
+                    transformed = pd.Series(
+                        np.divide(
+                            1.0,
+                            denominator,
+                            out=np.zeros(len(denominator), dtype=float),
+                            where=denominator.to_numpy() != 0,
+                        ),
+                        index=values.index,
+                    )
+                result[feature_name] = transformed.replace([np.inf, -np.inf], np.nan)
+                self._record_feature(
+                    feature_name,
+                    f'{operation.title()} transformation of {column}'
+                    + (f' after shifting by {shift:g}' if operation in {'log', 'sqrt'} and shift else ''),
+                )
+        return result
     
     def create_interaction_features(
         self,
@@ -95,7 +146,56 @@ class FeatureEngineeringPipeline:
         pd.DataFrame
             Dataframe with interaction features
         """
-        pass
+        valid_operations = {
+            'multiply', 'add', 'subtract', 'divide', 'ratio',
+        }
+        unknown_operations = set(operations) - valid_operations
+        if unknown_operations:
+            raise ValueError(f"Unsupported interaction operation(s): {sorted(unknown_operations)}")
+
+        result = df.copy()
+        suffixes = {
+            'multiply': 'x',
+            'add': 'plus',
+            'subtract': 'minus',
+            'divide': 'div',
+            'ratio': 'ratio',
+        }
+        for first, second in column_pairs:
+            if first not in df.columns or second not in df.columns:
+                continue
+            if not (
+                pd.api.types.is_numeric_dtype(df[first])
+                and pd.api.types.is_numeric_dtype(df[second])
+            ):
+                continue
+            left = pd.to_numeric(df[first], errors='coerce')
+            right = pd.to_numeric(df[second], errors='coerce')
+            for operation in operations:
+                feature_name = f'{first}_{suffixes[operation]}_{second}'
+                if operation == 'multiply':
+                    values = left * right
+                elif operation == 'add':
+                    values = left + right
+                elif operation == 'subtract':
+                    values = left - right
+                else:
+                    denominator = right.to_numpy(dtype=float)
+                    values = pd.Series(
+                        np.divide(
+                            left.to_numpy(dtype=float),
+                            denominator,
+                            out=np.zeros(len(left), dtype=float),
+                            where=denominator != 0,
+                        ),
+                        index=df.index,
+                    )
+                result[feature_name] = values.replace([np.inf, -np.inf], np.nan)
+                self._record_feature(
+                    feature_name,
+                    f'{operation.title()} interaction between {first} and {second}',
+                )
+        return result
     
     def create_aggregation_features(
         self,
@@ -123,7 +223,28 @@ class FeatureEngineeringPipeline:
         pd.DataFrame
             Dataframe with aggregation features
         """
-        pass
+        valid_functions = {'mean', 'std', 'min', 'max', 'count'}
+        unknown_functions = set(agg_functions) - valid_functions
+        if unknown_functions:
+            raise ValueError(f"Unsupported aggregation function(s): {sorted(unknown_functions)}")
+        if group_by not in df.columns:
+            return df.copy()
+
+        result = df.copy()
+        columns = [
+            column for column in agg_columns
+            if column in df.columns and pd.api.types.is_numeric_dtype(df[column])
+        ]
+        for column in columns:
+            grouped = df.groupby(group_by, dropna=False)[column]
+            for function in agg_functions:
+                feature_name = f'{column}_{function}_by_{group_by}'
+                result[feature_name] = df[group_by].map(getattr(grouped, function)())
+                self._record_feature(
+                    feature_name,
+                    f'{function.title()} of {column} within each {group_by} group',
+                )
+        return result
     
     def encode_onehot(
         self,
@@ -151,7 +272,41 @@ class FeatureEngineeringPipeline:
         pd.DataFrame
             Dataframe with one-hot encoded features
         """
-        pass
+        if max_categories < 1:
+            raise ValueError("max_categories must be at least 1.")
+        result = df.copy()
+        for column in columns:
+            if column not in df.columns:
+                continue
+
+            series = df[column].map(self._category_key)
+            frequencies = series.value_counts(dropna=False)
+            kept_categories = frequencies.index[:max_categories].tolist()
+            grouped = series.where(series.isin(kept_categories), 'Other')
+            # Ensure the reserved label is not confused with an original category.
+            if 'Other' in kept_categories:
+                grouped = series.where(series.isin(kept_categories), '<Other>')
+            categories = list(dict.fromkeys(grouped.tolist()))
+            if drop_first and categories:
+                encoded_categories = categories[1:]
+            else:
+                encoded_categories = categories
+            encoded_names = {}
+            for category in encoded_categories:
+                safe_category = str(category).replace(' ', '_')
+                feature_name = f'{column}_{safe_category}'
+                encoded_names[category] = feature_name
+                result[feature_name] = (grouped == category).astype(int)
+                self._record_feature(feature_name, f'One-hot encoding for {column} = {category}')
+            result = result.drop(columns=[column])
+            self.encoders[f'{column}_onehot'] = {
+                'categories': kept_categories,
+                'encoded_categories': encoded_categories,
+                'columns': encoded_names,
+                'drop_first': drop_first,
+                'other_label': '<Other>' if 'Other' in kept_categories else 'Other',
+            }
+        return result
     
     def encode_label(
         self,
@@ -173,7 +328,18 @@ class FeatureEngineeringPipeline:
         pd.DataFrame
             Dataframe with label encoded features
         """
-        pass
+        result = df.copy()
+        for column in columns:
+            if column not in df.columns:
+                continue
+            categories = df[column].map(self._category_key)
+            unique_categories = sorted(categories.unique(), key=lambda value: str(value))
+            mapping = {category: index for index, category in enumerate(unique_categories)}
+            feature_name = f'{column}_label'
+            result[feature_name] = categories.map(mapping).astype(int)
+            self.encoders[f'{column}_label'] = mapping
+            self._record_feature(feature_name, f'Integer label encoding of {column}')
+        return result
     
     def encode_target(
         self,
@@ -201,7 +367,36 @@ class FeatureEngineeringPipeline:
         pd.DataFrame
             Dataframe with target encoded features
         """
-        pass
+        if smoothing < 0:
+            raise ValueError("smoothing must be non-negative.")
+        if target not in df.columns:
+            return df.copy()
+        result = df.copy()
+        target_values = pd.to_numeric(df[target], errors='coerce')
+        global_mean = float(target_values.mean()) if target_values.notna().any() else 0.0
+        for column in columns:
+            if column not in df.columns or column == target:
+                continue
+            keys = df[column].map(self._category_key)
+            stats = pd.DataFrame({'category': keys, 'target': target_values}).groupby(
+                'category', dropna=False
+            )['target'].agg(['mean', 'count'])
+            if smoothing == 0:
+                mapping = stats['mean'].fillna(global_mean).to_dict()
+            else:
+                smoothed = (
+                    stats['mean'] * stats['count'] + global_mean * smoothing
+                ) / (stats['count'] + smoothing)
+                mapping = smoothed.fillna(global_mean).to_dict()
+            feature_name = f'{column}_target'
+            result[feature_name] = keys.map(mapping).fillna(global_mean).astype(float)
+            self.encoders[f'{column}_target'] = {
+                'mapping': mapping,
+                'global_mean': global_mean,
+                'smoothing': smoothing,
+            }
+            self._record_feature(feature_name, f'Smoothed target mean encoding of {column}')
+        return result
     
     def encode_frequency(
         self,
@@ -223,7 +418,17 @@ class FeatureEngineeringPipeline:
         pd.DataFrame
             Dataframe with frequency encoded features
         """
-        pass
+        result = df.copy()
+        for column in columns:
+            if column not in df.columns:
+                continue
+            keys = df[column].map(self._category_key)
+            mapping = keys.value_counts(normalize=True, dropna=False).to_dict()
+            feature_name = f'{column}_freq'
+            result[feature_name] = keys.map(mapping).astype(float)
+            self.encoders[f'{column}_frequency'] = mapping
+            self._record_feature(feature_name, f'Normalized category frequency of {column}')
+        return result
     
     def create_polynomial_features(
         self,
@@ -251,7 +456,45 @@ class FeatureEngineeringPipeline:
         pd.DataFrame
             Dataframe with polynomial features
         """
-        pass
+        if degree not in {2, 3}:
+            raise ValueError("degree must be 2 or 3.")
+        valid_columns = [
+            column for column in columns
+            if column in df.columns
+            and pd.api.types.is_numeric_dtype(df[column])
+            and df[column].replace([np.inf, -np.inf], np.nan).notna().any()
+        ]
+        if not valid_columns:
+            return df.copy()
+
+        features = df[valid_columns].replace([np.inf, -np.inf], np.nan)
+        imputer = SimpleImputer(strategy='median')
+        prepared = imputer.fit_transform(features)
+        polynomial = PolynomialFeatures(degree=degree, include_bias=include_bias)
+        transformed = polynomial.fit_transform(prepared)
+        powers = polynomial.powers_
+        result = df.copy()
+        for index, exponent_vector in enumerate(powers):
+            if exponent_vector.sum() == 0:
+                name = 'poly_bias'
+            else:
+                parts = []
+                for column, exponent in zip(valid_columns, exponent_vector):
+                    if exponent == 1:
+                        parts.append(column)
+                    elif exponent > 1:
+                        parts.append(f'{column}^{exponent}')
+                name = 'poly_' + '_'.join(parts)
+            if name in df.columns:
+                continue
+            result[name] = transformed[:, index]
+            self._record_feature(name, f'Degree-{int(exponent_vector.sum())} polynomial feature from {", ".join(valid_columns)}')
+        self.encoders['polynomial'] = {
+            'transformer': polynomial,
+            'imputer': imputer,
+            'columns': valid_columns,
+        }
+        return result
     
     def select_features_univariate(
         self,
@@ -279,17 +522,20 @@ class FeatureEngineeringPipeline:
         Tuple[List[str], np.ndarray]
             Selected feature names and their scores
         """
-        selector = SelectKBest(score_func=score_func, k=min(k, X.shape[1]))
-        selector.fit(X, y)
+        if k < 1:
+            raise ValueError("k must be at least 1.")
+        prepared, feature_names, target = self._prepare_selection_data(X, y)
+        selector = SelectKBest(score_func=score_func, k=min(k, len(feature_names)))
+        selector.fit(prepared, target)
         
         # Get selected features
         selected_mask = selector.get_support()
-        selected_features = X.columns[selected_mask].tolist()
+        selected_features = feature_names[selected_mask].tolist()
         
         # Get scores for all features
-        scores = selector.scores_
+        scores = np.nan_to_num(selector.scores_, nan=0.0, posinf=0.0, neginf=0.0)
         
-        self.feature_importance_scores['univariate'] = dict(zip(X.columns, scores))
+        self.feature_importance_scores['univariate'] = dict(zip(feature_names, scores))
         
         return selected_features, scores
     
@@ -319,6 +565,9 @@ class FeatureEngineeringPipeline:
         List[str]
             Selected feature names
         """
+        if n_features < 1 or step < 1:
+            raise ValueError("n_features and step must be at least 1.")
+        prepared, feature_names, target = self._prepare_selection_data(X, y)
         estimator = LogisticRegression(
             max_iter=1000,
             random_state=self.random_state,
@@ -327,17 +576,17 @@ class FeatureEngineeringPipeline:
         
         selector = RFE(
             estimator=estimator,
-            n_features_to_select=min(n_features, X.shape[1]),
+            n_features_to_select=min(n_features, len(feature_names)),
             step=step
         )
-        selector.fit(X, y)
+        selector.fit(prepared, target)
         
         # Get selected features
         selected_mask = selector.get_support()
-        selected_features = X.columns[selected_mask].tolist()
+        selected_features = feature_names[selected_mask].tolist()
         
         # Get rankings
-        rankings = dict(zip(X.columns, selector.ranking_))
+        rankings = dict(zip(feature_names, selector.ranking_))
         self.feature_importance_scores['rfe'] = rankings
         
         return selected_features
@@ -365,12 +614,15 @@ class FeatureEngineeringPipeline:
         Tuple[List[str], np.ndarray]
             Selected feature names and their importance scores
         """
+        if n_features < 1:
+            raise ValueError("n_features must be at least 1.")
+        prepared, feature_names, target = self._prepare_selection_data(X, y)
         rf = RandomForestClassifier(
             n_estimators=100,
             random_state=self.random_state,
             n_jobs=-1
         )
-        rf.fit(X, y)
+        rf.fit(prepared, target)
         
         # Get feature importances
         importances = rf.feature_importances_
@@ -378,13 +630,40 @@ class FeatureEngineeringPipeline:
         # Sort and select top features
         indices = np.argsort(importances)[::-1]
         top_indices = indices[:n_features]
-        selected_features = X.columns[top_indices].tolist()
+        selected_features = feature_names[top_indices].tolist()
         
         self.feature_importance_scores['random_forest'] = dict(
-            zip(X.columns, importances)
+            zip(feature_names, importances)
         )
         
         return selected_features, importances
+
+    @staticmethod
+    def _prepare_selection_data(
+        X: pd.DataFrame,
+        y: pd.Series,
+    ) -> Tuple[pd.DataFrame, pd.Index, pd.Series]:
+        if not isinstance(X, pd.DataFrame):
+            X = pd.DataFrame(X)
+        if len(X) != len(y):
+            raise ValueError("X and y must contain the same number of rows.")
+        feature_names = X.select_dtypes(include=[np.number]).columns
+        if len(feature_names) == 0:
+            raise ValueError("Feature selection requires numeric feature columns.")
+
+        features = X[feature_names].replace([np.inf, -np.inf], np.nan)
+        feature_names = features.columns[features.notna().any()].copy()
+        if len(feature_names) == 0:
+            raise ValueError("Feature selection requires at least one non-empty numeric column.")
+        target = pd.Series(np.asarray(y), index=X.index)
+        valid_target = target.notna()
+        features = features.loc[valid_target, feature_names]
+        target = target.loc[valid_target]
+        if features.empty:
+            raise ValueError("Feature selection requires rows with non-missing target values.")
+        prepared_values = SimpleImputer(strategy='median').fit_transform(features)
+        prepared = pd.DataFrame(prepared_values, columns=feature_names, index=features.index)
+        return prepared, feature_names, target
     
     def get_feature_catalog(self) -> pd.DataFrame:
         """
@@ -398,7 +677,7 @@ class FeatureEngineeringPipeline:
         catalog_df = pd.DataFrame([
             {'Feature': k, 'Description': v, 'Type': 'Engineered'}
             for k, v in self.feature_catalog.items()
-        ])
+        ], columns=['Feature', 'Description', 'Type'])
         
         return catalog_df
     
@@ -428,28 +707,55 @@ class FeatureEngineeringPipeline:
         Dict[str, float]
             Performance scores for original and engineered features
         """
-        model = LogisticRegression(
-            max_iter=1000,
-            random_state=self.random_state,
-            solver='lbfgs'
+        if cv < 2:
+            raise ValueError("cv must be at least 2.")
+        if len(X_original) != len(y) or len(X_engineered) != len(y):
+            raise ValueError("Feature matrices and target must contain the same number of rows.")
+        target = pd.Series(np.asarray(y))
+        valid_target = target.notna().to_numpy()
+        target = target.loc[valid_target]
+        if target.nunique() < 2:
+            raise ValueError("Feature impact evaluation requires at least two target classes.")
+        n_splits = min(cv, int(target.value_counts().min()))
+        if n_splits < 2:
+            raise ValueError("Each target class must have at least two rows for cross-validation.")
+        splitter = StratifiedKFold(
+            n_splits=n_splits, shuffle=True, random_state=self.random_state
         )
-        
-        # Evaluate original features
-        scores_original = cross_val_score(
-            model, X_original, y, cv=cv, scoring='accuracy'
+        model = make_pipeline(
+            SimpleImputer(strategy='median'),
+            StandardScaler(),
+            LogisticRegression(
+                max_iter=1000,
+                random_state=self.random_state,
+                solver='lbfgs',
+            ),
         )
-        
-        # Evaluate engineered features
-        scores_engineered = cross_val_score(
-            model, X_engineered, y, cv=cv, scoring='accuracy'
-        )
+
+        def evaluate(features: pd.DataFrame) -> np.ndarray:
+            if not isinstance(features, pd.DataFrame):
+                features = pd.DataFrame(features)
+            if len(features) != len(y):
+                raise ValueError("Feature matrices and target must contain the same number of rows.")
+            numeric_features = features.select_dtypes(include=[np.number])
+            numeric_features = numeric_features.replace([np.inf, -np.inf], np.nan)
+            non_empty = numeric_features.columns[numeric_features.notna().any()]
+            if len(non_empty) == 0:
+                raise ValueError("Feature impact evaluation requires numeric feature columns.")
+            selected_features = numeric_features.loc[valid_target, non_empty]
+            return cross_val_score(
+                model, selected_features, target, cv=splitter, scoring='accuracy'
+            )
+
+        scores_original = evaluate(X_original)
+        scores_engineered = evaluate(X_engineered)
         
         return {
-            'original_mean': scores_original.mean(),
-            'original_std': scores_original.std(),
-            'engineered_mean': scores_engineered.mean(),
-            'engineered_std': scores_engineered.std(),
-            'improvement': scores_engineered.mean() - scores_original.mean()
+            'original_mean': float(scores_original.mean()),
+            'original_std': float(scores_original.std()),
+            'engineered_mean': float(scores_engineered.mean()),
+            'engineered_std': float(scores_engineered.std()),
+            'improvement': float(scores_engineered.mean() - scores_original.mean())
         }
 
 
@@ -545,12 +851,15 @@ def visualize_feature_importance(
         key=lambda x: abs(x[1]),
         reverse=True
     )[:top_n]
-    
+    if not sorted_features:
+        print("No feature importance scores available to visualize")
+        return
+
     features, scores = zip(*sorted_features)
     
     plt.figure(figsize=(10, 8))
     colors = plt.cm.viridis(np.linspace(0, 1, len(features)))
-    bars = plt.barh(range(len(features)), scores, color=colors)
+    plt.barh(range(len(features)), scores, color=colors)
     plt.yticks(range(len(features)), features)
     plt.xlabel('Importance Score')
     plt.title(title)
@@ -684,33 +993,47 @@ def visualize_polynomial_impact(
     output_path : str
         Path to save the plot
     """
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    
-    # Original feature
-    axes[0].scatter(X_original, y, alpha=0.5, s=20)
+    original = np.asarray(X_original, dtype=float).reshape(-1)
+    polynomial_features = np.asarray(X_poly, dtype=float)
+    if polynomial_features.ndim == 1:
+        polynomial_features = polynomial_features.reshape(-1, 1)
+    target = np.asarray(y, dtype=float).reshape(-1)
+    if len(original) != len(target) or len(polynomial_features) != len(target):
+        raise ValueError("X_original, X_poly, and y must contain the same number of rows.")
+    valid = (
+        np.isfinite(original)
+        & np.isfinite(target)
+        & np.isfinite(polynomial_features).all(axis=1)
+    )
+    if not valid.any():
+        raise ValueError("At least one finite observation is required for the plot.")
+    original = original[valid]
+    polynomial_features = polynomial_features[valid]
+    target = target[valid]
+
+    _, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    axes[0].scatter(original, target, alpha=0.5, s=20)
     axes[0].set_xlabel(feature_name)
     axes[0].set_ylabel('Target')
     axes[0].set_title('Original Feature vs Target')
     axes[0].grid(True, alpha=0.3)
     
-    # With polynomial fit
-    axes[1].scatter(X_original, y, alpha=0.5, s=20, label='Data')
-    
-    # Fit polynomial
-    from sklearn.preprocessing import PolynomialFeatures
-    from sklearn.linear_model import LinearRegression
-    
-    poly = PolynomialFeatures(degree=2)
-    X_poly_fit = poly.fit_transform(X_original.reshape(-1, 1))
+    axes[1].scatter(original, target, alpha=0.5, s=20, label='Data')
     model = LinearRegression()
-    model.fit(X_poly_fit, y)
-    
-    # Plot fit
-    X_plot = np.linspace(X_original.min(), X_original.max(), 100).reshape(-1, 1)
-    X_plot_poly = poly.transform(X_plot)
-    y_pred = model.predict(X_plot_poly)
-    
-    axes[1].plot(X_plot, y_pred, 'r-', linewidth=2, label='Polynomial Fit')
+    model.fit(polynomial_features, target)
+    plot_values = np.linspace(original.min(), original.max(), 100)
+    if polynomial_features.shape[1] == 2:
+        plot_features = np.column_stack((plot_values, plot_values ** 2))
+        predictions = model.predict(plot_features)
+        axes[1].plot(plot_values, predictions, 'r-', linewidth=2, label='Polynomial Fit')
+    elif polynomial_features.shape[1] == 1:
+        predictions = model.predict(plot_values.reshape(-1, 1))
+        axes[1].plot(plot_values, predictions, 'r-', linewidth=2, label='Fitted line')
+    else:
+        order = np.argsort(original)
+        predictions = model.predict(polynomial_features)
+        axes[1].plot(original[order], predictions[order], 'r-', linewidth=2, label='Polynomial Fit')
     axes[1].set_xlabel(feature_name)
     axes[1].set_ylabel('Target')
     axes[1].set_title('Polynomial Features (Degree 2)')
@@ -740,13 +1063,16 @@ def visualize_encoding_comparison(
     """
     methods = list(performance_dict.keys())
     scores = list(performance_dict.values())
+    if not methods:
+        print("No encoding performance scores available to visualize")
+        return
     
     plt.figure(figsize=(10, 6))
     colors = plt.cm.Set3(np.linspace(0, 1, len(methods)))
     bars = plt.bar(range(len(methods)), scores, color=colors, edgecolor='black', linewidth=1.5)
     
     # Add value labels on bars
-    for i, (bar, score) in enumerate(zip(bars, scores)):
+    for bar, score in zip(bars, scores):
         plt.text(
             bar.get_x() + bar.get_width() / 2,
             bar.get_height() + 0.005,
@@ -895,16 +1221,14 @@ if __name__ == "__main__":
     # Categorical encoding
     print("\n6. Encoding categorical features...")
     
-    # Target encoding
+    # Add temporary target for encoding
+    df['target_temp'] = y
     df = pipeline.encode_target(
         df,
         columns=['cat_feature_1'],
         target='target_temp',
         smoothing=10.0
     )
-    
-    # Add temporary target for encoding
-    df['target_temp'] = y
     df = pipeline.encode_target(
         df,
         columns=['cat_feature_2'],

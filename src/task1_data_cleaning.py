@@ -52,7 +52,21 @@ class DataQualityAnalyzer:
             Dict: Dictionary containing total_rows, total_columns, duplicates, 
                 missing_values, missing_percentage, data_types, and memory_usage
         """
-        pass
+        missing_values = self.data.isnull().sum()
+        missing_percentage = (missing_values / len(self.data) * 100) if len(self.data) else pd.Series(dtype=float)
+        report = {
+            'total_rows': len(self.data),
+            'total_columns': len(self.data.columns),
+            'duplicates': int(self.data.duplicated().sum()),
+            'missing_values': missing_values.to_dict(),
+            'missing_percentage': missing_percentage.to_dict(),
+            'data_types': self.data.dtypes.astype(str).to_dict(),
+            'memory_usage': float(self.data.memory_usage(deep=True).sum() / (1024 ** 2))
+        }
+        if self.data.empty:
+            report['missing_values'] = {}
+            report['missing_percentage'] = {}
+        return report
     
     def identify_missing_pattern(self, column: str) -> str:
         """
@@ -64,7 +78,47 @@ class DataQualityAnalyzer:
         Returns:
             str: String indicating likely missing pattern (MCAR, MAR, or MNAR)
         """
-        pass
+        if column not in self.data.columns:
+            return "Column not found"
+        if self.data[column].isnull().sum() == 0:
+            return "No missing values"
+
+        missing_mask = self.data[column].isnull()
+        non_missing = self.data.loc[~missing_mask]
+        missing = self.data.loc[missing_mask]
+
+        if len(self.data.columns) <= 1:
+            return "Likely MCAR (Missing Completely at Random)"
+
+        candidate_cols = [c for c in self.data.columns if c != column]
+        if not candidate_cols:
+            return "Likely MCAR (Missing Completely at Random)"
+
+        abs_corr = []
+        for c in candidate_cols:
+            if self.data[c].dtype.kind in 'biufc':
+                corr = pd.Series(self.data[c].dropna().values).corr(
+                    pd.Series(missing_mask.loc[self.data[c].notna()].astype(int).values)
+                )
+                if pd.notna(corr):
+                    abs_corr.append(abs(float(corr)))
+
+        if abs_corr and np.mean(abs_corr) > 0.2:
+            return "Likely MAR (Missing at Random)"
+
+        # Compare the missing distribution with the observed values of the same column
+        if missing.empty or non_missing.empty:
+            return "Likely MCAR (Missing Completely at Random)"
+
+        # If missing values are concentrated in extreme values of the column itself, this is often MNAR.
+        if self.data[column].dtype.kind in 'biufc':
+            observed = self.data[column].dropna()
+            if not observed.empty and np.nanmean(observed) > 0:
+                if missing[column].size > 0:
+                    # crude heuristic: missingness is more likely in high/low tail
+                    if observed.quantile(0.75) <= missing[column].mean() if hasattr(missing[column], 'mean') else False:
+                        return "Possibly MNAR (Missing Not at Random)"
+        return "Likely MCAR (Missing Completely at Random)"
     
     def create_missing_indicators(self) -> pd.DataFrame:
         """
@@ -73,7 +127,12 @@ class DataQualityAnalyzer:
         Returns:
             pd.DataFrame: DataFrame with binary indicators for missing values
         """
-        pass
+        indicator_df = pd.DataFrame(index=self.data.index)
+        for col in self.data.columns:
+            if self.data[col].isnull().sum() > 0:
+                indicator_df[f'{col}_missing'] = self.data[col].isnull().astype(int)
+        self.missing_indicators = indicator_df.copy()
+        return indicator_df.copy()
     
     def simple_imputation(self, strategy: str = 'mean') -> pd.DataFrame:
         """
@@ -85,7 +144,41 @@ class DataQualityAnalyzer:
         Returns:
             pd.DataFrame: DataFrame with imputed values
         """
-        pass
+        valid_strategies = {'mean', 'median', 'most_frequent'}
+        if strategy not in valid_strategies:
+            raise ValueError(f"Unsupported strategy '{strategy}'. Use one of {sorted(valid_strategies)}.")
+
+        result = self.data.copy()
+        if result.empty:
+            key = f'simple_{strategy}' if strategy != 'most_frequent' else 'simple_most_frequent'
+            self.imputed_datasets[key] = result.copy()
+            return result.copy()
+
+        for column in result.columns:
+            if not result[column].isnull().any():
+                continue
+
+            if strategy in {'mean', 'median'} and pd.api.types.is_numeric_dtype(result[column]):
+                imputer = SimpleImputer(strategy=strategy)
+                imputed_values = imputer.fit_transform(result[[column]])
+                result[column] = imputed_values.ravel()
+                continue
+
+            if strategy == 'most_frequent':
+                imputer = SimpleImputer(strategy='most_frequent')
+                imputed_values = imputer.fit_transform(result[[column]])
+                result[column] = imputed_values.ravel()
+                continue
+
+            # For non-numeric columns under mean/median, use the most frequent value
+            # to keep the dataset usable without raising a sklearn error.
+            imputer = SimpleImputer(strategy='most_frequent')
+            imputed_values = imputer.fit_transform(result[[column]])
+            result[column] = imputed_values.ravel()
+
+        key = f'simple_{strategy}' if strategy != 'most_frequent' else 'simple_most_frequent'
+        self.imputed_datasets[key] = result.copy()
+        return result.copy()
     
     def knn_imputation(self, n_neighbors: int = 5) -> pd.DataFrame:
         """
@@ -97,7 +190,18 @@ class DataQualityAnalyzer:
         Returns:
             pd.DataFrame: DataFrame with KNN imputed values
         """
-        pass
+        num_cols = self.data.select_dtypes(include=[np.number]).columns.tolist()
+        if not num_cols:
+            raise ValueError('KNN imputation requires at least one numeric column.')
+
+        knn_imputer = KNNImputer(n_neighbors=n_neighbors)
+        imputed = knn_imputer.fit_transform(self.data[num_cols])
+        result = pd.DataFrame(imputed, columns=num_cols, index=self.data.index)
+        for col in self.data.columns:
+            if col not in num_cols:
+                result[col] = self.data[col].copy()
+        self.imputed_datasets['knn'] = result.copy()
+        return result.copy()
     
     def iterative_imputation(self, max_iter: int = 10) -> pd.DataFrame:
         """
@@ -109,7 +213,18 @@ class DataQualityAnalyzer:
         Returns:
             pd.DataFrame: DataFrame with iteratively imputed values
         """
-        pass
+        numeric_cols = self.data.select_dtypes(include=[np.number]).columns.tolist()
+        if not numeric_cols:
+            raise ValueError('IterativeImputer requires at least one numeric column.')
+
+        imputer = IterativeImputer(max_iter=max_iter, random_state=42)
+        imputed = imputer.fit_transform(self.data[numeric_cols])
+        result = pd.DataFrame(imputed, columns=numeric_cols, index=self.data.index)
+        for col in self.data.columns:
+            if col not in numeric_cols:
+                result[col] = self.data[col].copy()
+        self.imputed_datasets['iterative'] = result.copy()
+        return result.copy()
     
     def compare_imputation_methods(self) -> pd.DataFrame:
         """
@@ -119,12 +234,20 @@ class DataQualityAnalyzer:
             DataFrame with comparison statistics
         """
         comparison = {}
-        
-        # Original data statistics (excluding missing values)
-        comparison['original'] = self.original_data.describe().loc[['mean', 'std', 'min', 'max']]
-        
-        # Statistics for each imputed dataset
-        pass
+
+        original_numeric = self.original_data.select_dtypes(include=[np.number])
+        if not original_numeric.empty:
+            comparison['original'] = original_numeric.describe().loc[['mean', 'std', 'min', 'max']]
+
+        for method_name, df in self.imputed_datasets.items():
+            numeric = df.select_dtypes(include=[np.number])
+            if not numeric.empty:
+                comparison[method_name] = numeric.describe().loc[['mean', 'std', 'min', 'max']]
+
+        if not comparison:
+            return pd.DataFrame()
+
+        return pd.concat(comparison.values(), axis=1, keys=comparison.keys())
     
     def visualize_missing_data(self, figsize: Tuple[int, int] = (15, 10)):
         """
@@ -191,14 +314,25 @@ class DataQualityAnalyzer:
         Returns:
             matplotlib.figure.Figure: The generated figure object
         """
-        if column not in self.data.select_dtypes(include=[np.number]).columns:
-            print(f"Column '{column}' is not numeric or does not exist")
+        if column not in self.data.columns:
+            print(f"Column '{column}' does not exist")
             return
-        
-        fig, axes = plt.subplots(2, 3, figsize=figsize)
+
+        if not pd.api.types.is_numeric_dtype(self.data[column]):
+            print(f"Column '{column}' is not numeric")
+            return
+
+        methods = list(self.imputed_datasets.keys())
+        if not methods:
+            print("No imputation results available to compare")
+            return
+
+        n_plots = min(len(methods) + 1, 6)
+        n_rows = 2
+        n_cols = 3
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize)
         axes = axes.flatten()
-        
-        # Original data (with missing values removed for visualization)
+
         ax = axes[0]
         self.original_data[column].dropna().hist(bins=30, ax=ax, color='skyblue', edgecolor='black', alpha=0.7)
         ax.axvline(self.original_data[column].mean(), color='red', linestyle='--', linewidth=2, label='Mean')
@@ -208,10 +342,10 @@ class DataQualityAnalyzer:
         ax.set_ylabel('Frequency')
         ax.legend()
         ax.grid(axis='y', alpha=0.3)
-        
-        # Imputed datasets
-        methods = list(self.imputed_datasets.keys())
+
         for idx, method in enumerate(methods[:5], start=1):
+            if idx >= n_plots:
+                break
             ax = axes[idx]
             imputed_df = self.imputed_datasets[method]
             imputed_df[column].hist(bins=30, ax=ax, color='lightcoral', edgecolor='black', alpha=0.7)
@@ -222,11 +356,10 @@ class DataQualityAnalyzer:
             ax.set_ylabel('Frequency')
             ax.legend()
             ax.grid(axis='y', alpha=0.3)
-        
-        # Hide unused subplot if less than 5 methods
-        if len(methods) < 5:
-            axes[5].axis('off')
-        
+
+        for idx in range(n_plots, len(axes)):
+            axes[idx].axis('off')
+
         plt.suptitle(f'Distribution Comparison: {column}', fontsize=14, fontweight='bold', y=1.02)
         plt.tight_layout()
         return fig
@@ -239,41 +372,37 @@ class DataQualityAnalyzer:
             figsize: Figure size for plots
         """
         numeric_cols = self.data.select_dtypes(include=[np.number]).columns
-        
+
         if len(numeric_cols) < 2:
             print("Need at least 2 numeric columns for correlation comparison")
             return
-        
-        n_methods = len(self.imputed_datasets) + 1
+
+        methods = list(self.imputed_datasets.keys())
+        n_methods = len(methods) + 1
         n_cols = min(3, n_methods)
         n_rows = (n_methods + n_cols - 1) // n_cols
-        
+
         fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize)
-        if n_methods == 1:
-            axes = [axes]
-        else:
-            axes = axes.flatten() if n_methods > 1 else [axes]
-        
-        # Original correlation (pairwise deletion of missing values)
+        axes = axes.flatten() if isinstance(axes, np.ndarray) else [axes]
+
         ax = axes[0]
         corr_original = self.original_data[numeric_cols].corr()
-        sns.heatmap(corr_original, annot=True, fmt='.2f', cmap='coolwarm', 
+        sns.heatmap(corr_original, annot=True, fmt='.2f', cmap='coolwarm',
                    center=0, square=True, linewidths=1, cbar_kws={"shrink": 0.8}, ax=ax)
         ax.set_title('Original Data Correlation', fontweight='bold')
-        
-        # Imputed correlations
-        for idx, (method_name, imputed_df) in enumerate(self.imputed_datasets.items(), start=1):
-            if idx < len(axes):
-                ax = axes[idx]
-                corr_imputed = imputed_df[numeric_cols].corr()
-                sns.heatmap(corr_imputed, annot=True, fmt='.2f', cmap='coolwarm',
-                           center=0, square=True, linewidths=1, cbar_kws={"shrink": 0.8}, ax=ax)
-                ax.set_title(f'{method_name.upper()} Imputation', fontweight='bold')
-        
-        # Hide unused subplots
+
+        for idx, method_name in enumerate(methods, start=1):
+            if idx >= len(axes):
+                break
+            ax = axes[idx]
+            corr_imputed = self.imputed_datasets[method_name][numeric_cols].corr()
+            sns.heatmap(corr_imputed, annot=True, fmt='.2f', cmap='coolwarm',
+                       center=0, square=True, linewidths=1, cbar_kws={"shrink": 0.8}, ax=ax)
+            ax.set_title(f'{method_name.upper()} Imputation', fontweight='bold')
+
         for idx in range(n_methods, len(axes)):
             axes[idx].axis('off')
-        
+
         plt.suptitle('Correlation Matrix Comparison', fontsize=14, fontweight='bold', y=1.02)
         plt.tight_layout()
         return fig

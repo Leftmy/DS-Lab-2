@@ -20,19 +20,17 @@ from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler
 from sklearn.impute import SimpleImputer, KNNImputer
-from sklearn.feature_selection import SelectKBest, f_classif, RFE
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.feature_selection import SelectKBest, f_classif
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import (
     train_test_split, cross_val_score, learning_curve, 
     GridSearchCV, StratifiedKFold
 )
 from sklearn.metrics import (
-    accuracy_score, classification_report, confusion_matrix, 
+    accuracy_score, confusion_matrix, 
     roc_curve, auc, roc_auc_score
 )
 from sklearn.datasets import make_classification
-from scipy import stats
 from typing import Tuple, Dict, List, Optional, Any
 import warnings
 import joblib
@@ -67,19 +65,41 @@ class OutlierHandler(BaseEstimator, TransformerMixin):
         Returns:
             self: Fitted transformer
         """
-        X = pd.DataFrame(X) if not isinstance(X, pd.DataFrame) else X
+        if self.method not in {'iqr', 'zscore'}:
+            raise ValueError("method must be 'iqr' or 'zscore'.")
+        if self.strategy not in {'cap', 'remove'}:
+            raise ValueError("strategy must be 'cap' or 'remove'.")
+        if not np.isfinite(self.threshold) or self.threshold < 0:
+            raise ValueError("threshold must be a finite non-negative number.")
+
+        if isinstance(X, pd.DataFrame):
+            X = X.copy()
+            feature_names = np.asarray(X.columns, dtype=object)
+        else:
+            raw = np.asarray(X)
+            feature_names = np.asarray([f'x{i}' for i in range(raw.shape[1])], dtype=object)
+            X = pd.DataFrame(raw, columns=feature_names)
+        self.feature_names_in_ = feature_names
+        self.n_features_in_ = X.shape[1]
+        self.bounds_ = {}
         
         for col in X.columns:
+            values = pd.to_numeric(X[col], errors='coerce').replace(
+                [np.inf, -np.inf], np.nan
+            )
+            if values.notna().sum() == 0:
+                self.bounds_[col] = (np.nan, np.nan)
+                continue
             if self.method == 'iqr':
-                Q1 = X[col].quantile(0.25)
-                Q3 = X[col].quantile(0.75)
+                Q1 = values.quantile(0.25)
+                Q3 = values.quantile(0.75)
                 IQR = Q3 - Q1
                 lower = Q1 - self.threshold * IQR
                 upper = Q3 + self.threshold * IQR
                 self.bounds_[col] = (lower, upper)
             elif self.method == 'zscore':
-                mean = X[col].mean()
-                std = X[col].std()
+                mean = values.mean()
+                std = values.std(ddof=0)
                 lower = mean - self.threshold * std
                 upper = mean + self.threshold * std
                 self.bounds_[col] = (lower, upper)
@@ -96,21 +116,25 @@ class OutlierHandler(BaseEstimator, TransformerMixin):
         Returns:
             np.ndarray: Transformed feature matrix
         """
-        X = pd.DataFrame(X) if not isinstance(X, pd.DataFrame) else X.copy()
+        if isinstance(X, pd.DataFrame):
+            X = X.copy()
+        else:
+            X = pd.DataFrame(X, columns=getattr(self, 'feature_names_in_', None))
+        if hasattr(self, 'n_features_in_') and X.shape[1] != self.n_features_in_:
+            raise ValueError("Input feature count differs from the fitted data.")
         
         if self.strategy == 'cap':
             for col in X.columns:
-                if col in self.bounds_:
+                if col in self.bounds_ and np.isfinite(self.bounds_[col]).all():
                     lower, upper = self.bounds_[col]
                     X[col] = X[col].clip(lower=lower, upper=upper)
         elif self.strategy == 'remove':
             # Mark outliers as NaN for imputation
             for col in X.columns:
-                if col in self.bounds_:
+                if col in self.bounds_ and np.isfinite(self.bounds_[col]).all():
                     lower, upper = self.bounds_[col]
-                    mask = (X[col] < lower) | (X[col] > upper)
+                    mask = (X[col] < lower) | (X[col] > upper) | ~np.isfinite(X[col])
                     X.loc[mask, col] = np.nan
-                    
         return X.values
 
 
@@ -143,7 +167,29 @@ class FeatureEngineer(BaseEstimator, TransformerMixin):
         Returns:
             self: Fitted transformer
         """
-        self.n_features_in_ = X.shape[1]
+        X_array = np.asarray(X)
+        if X_array.ndim != 2:
+            raise ValueError("X must be a two-dimensional feature matrix.")
+        self.n_features_in_ = X_array.shape[1]
+        self.feature_names_in_ = np.asarray(
+            X.columns if isinstance(X, pd.DataFrame)
+            else [f'x{i}' for i in range(X_array.shape[1])],
+            dtype=object,
+        )
+        names = list(self.feature_names_in_)
+        generated_names = names.copy()
+        if self.transformations:
+            generated_names.extend(f'{name}_log' for name in names)
+            generated_names.extend(f'{name}_sqrt' for name in names)
+        if self.interactions and self.n_features_in_ <= 10:
+            generated_names.extend(
+                f'{names[i]}_x_{names[j]}'
+                for i in range(min(3, self.n_features_in_))
+                for j in range(i + 1, min(3, self.n_features_in_))
+            )
+        if self.polynomials and self.n_features_in_ <= 5:
+            generated_names.extend(f'{name}_square' for name in names)
+        self.feature_names_ = np.asarray(generated_names, dtype=object)
         return self
     
     def transform(self, X):
@@ -156,7 +202,12 @@ class FeatureEngineer(BaseEstimator, TransformerMixin):
         Returns:
             np.ndarray: Transformed feature matrix with new features
         """
-        X_array = np.array(X)
+        X_array = np.asarray(X, dtype=float)
+        if X_array.ndim != 2:
+            raise ValueError("X must be a two-dimensional feature matrix.")
+        if X_array.shape[1] != self.n_features_in_:
+            raise ValueError("Input feature count differs from the fitted data.")
+        X_array = np.where(np.isfinite(X_array), X_array, 0.0)
         features = [X_array]
         
         # Mathematical transformations
@@ -183,6 +234,22 @@ class FeatureEngineer(BaseEstimator, TransformerMixin):
             features.append(square_features)
         
         return np.hstack(features)
+
+    def get_feature_names_out(self, input_features=None):
+        if not self.feature_names_.size:
+            raise ValueError("FeatureEngineer must be fitted before requesting feature names.")
+        if input_features is not None and len(input_features) != self.n_features_in_:
+            raise ValueError("input_features length does not match the fitted feature count.")
+        return self.feature_names_.copy()
+
+
+class AdaptiveSelectKBest(SelectKBest):
+    """Select no more features than are available after feature generation."""
+
+    def fit(self, X, y=None):
+        if isinstance(self.k, (int, np.integer)):
+            self.k = min(int(self.k), X.shape[1])
+        return super().fit(X, y)
 
 
 class PreprocessingPipeline:
@@ -212,7 +279,9 @@ class PreprocessingPipeline:
                        scaler_type: str = 'standard',
                        feature_engineering: bool = True,
                        feature_selection: bool = True,
-                       n_features: int = 20) -> Pipeline:
+                       n_features: int = 20,
+                       outlier_strategy: str = 'cap',
+                       outlier_threshold: Optional[float] = None) -> Pipeline:
         """
         Create a sklearn pipeline with specified preprocessing steps.
         
@@ -227,25 +296,50 @@ class PreprocessingPipeline:
         Returns:
             Pipeline: Configured sklearn pipeline
         """
-        steps = []
-        
-        # Step 1: Imputation
-        pass
-        
-        # Step 2: Outlier handling
-        pass
-        
-        # Step 3: Feature engineering
-        pass
-        
-        # Step 4: Scaling
-        pass
-        
-        # Step 5: Feature selection
-        pass
-        
-        # Step 6: Classifier
-        pass
+        if imputer_strategy not in {'mean', 'median', 'knn'}:
+            raise ValueError("imputer_strategy must be 'mean', 'median', or 'knn'.")
+        if outlier_method not in {'iqr', 'zscore'}:
+            raise ValueError("outlier_method must be 'iqr' or 'zscore'.")
+        if outlier_strategy not in {'cap', 'remove'}:
+            raise ValueError("outlier_strategy must be 'cap' or 'remove'.")
+        if scaler_type not in {'standard', 'robust', 'minmax'}:
+            raise ValueError("scaler_type must be 'standard', 'robust', or 'minmax'.")
+        if n_features < 1:
+            raise ValueError("n_features must be at least 1.")
+        if outlier_threshold is None:
+            outlier_threshold = 1.5 if outlier_method == 'iqr' else 3.0
+        if not np.isfinite(outlier_threshold) or outlier_threshold < 0:
+            raise ValueError("outlier_threshold must be finite and non-negative.")
+
+        imputer = (
+            KNNImputer(n_neighbors=5)
+            if imputer_strategy == 'knn'
+            else SimpleImputer(strategy=imputer_strategy)
+        )
+        scaler = {
+            'standard': StandardScaler,
+            'robust': RobustScaler,
+            'minmax': MinMaxScaler,
+        }[scaler_type]()
+        steps = [
+            ('outlier_handler', OutlierHandler(
+                method=outlier_method,
+                strategy=outlier_strategy,
+                threshold=outlier_threshold,
+            )),
+            ('imputer', imputer),
+        ]
+        if feature_engineering:
+            steps.append(('feature_engineer', FeatureEngineer()))
+        steps.append(('scaler', scaler))
+        if feature_selection:
+            steps.append(('feature_selector', AdaptiveSelectKBest(
+                score_func=f_classif, k=n_features
+            )))
+        steps.append((
+            'classifier',
+            LogisticRegression(max_iter=1000, random_state=self.random_state),
+        ))
         
         self.pipeline = Pipeline(steps)
         return self.pipeline
@@ -264,9 +358,26 @@ class PreprocessingPipeline:
         Returns:
             Tuple: X_train, X_test, y_train, y_test
         """
+        if len(X) != len(y):
+            raise ValueError("X and y must contain the same number of rows.")
+        if len(X) < 2:
+            raise ValueError("At least two rows are required for a train/test split.")
+        if not 0 < test_size < 1:
+            raise ValueError("test_size must be between 0 and 1.")
+        target = pd.Series(y)
+        if target.isna().any():
+            raise ValueError("Target values must not contain missing values.")
+        class_counts = target.value_counts()
+        if len(class_counts) < 2 or class_counts.min() < 2:
+            raise ValueError("Stratified splitting requires at least two rows per class.")
+        test_rows = int(np.ceil(len(X) * test_size))
+        train_rows = len(X) - test_rows
+        if test_rows < len(class_counts) or train_rows < len(class_counts):
+            raise ValueError("Both train and test sets must be large enough to contain every class.")
         self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(
             X, y, test_size=test_size, random_state=self.random_state, stratify=y
         )
+        self.feature_names = list(X.columns) if isinstance(X, pd.DataFrame) else []
         return self.X_train, self.X_test, self.y_train, self.y_test
     
     def fit_pipeline(self, X_train: np.ndarray, y_train: np.ndarray):
@@ -282,7 +393,10 @@ class PreprocessingPipeline:
         """
         if self.pipeline is None:
             self.create_pipeline()
-        
+        if len(X_train) != len(y_train):
+            raise ValueError("X_train and y_train must contain the same number of rows.")
+        if len(X_train) == 0:
+            raise ValueError("Cannot fit the pipeline on an empty training set.")
         self.pipeline.fit(X_train, y_train)
         return self
     
@@ -297,13 +411,24 @@ class PreprocessingPipeline:
         Returns:
             Dict: Evaluation metrics
         """
+        if self.pipeline is None or not hasattr(self.pipeline, 'classes_'):
+            raise ValueError("Fit the pipeline before evaluating it.")
+        if len(X_test) != len(y_test):
+            raise ValueError("X_test and y_test must contain the same number of rows.")
         y_pred = self.pipeline.predict(X_test)
-        y_pred_proba = self.pipeline.predict_proba(X_test)[:, 1]
-        
         metrics = {
-            'accuracy': accuracy_score(y_test, y_pred),
-            'roc_auc': roc_auc_score(y_test, y_pred_proba)
+            'accuracy': float(accuracy_score(y_test, y_pred)),
         }
+        if hasattr(self.pipeline, 'predict_proba') and len(self.pipeline.classes_) == 2:
+            positive_index = 1
+            y_pred_proba = self.pipeline.predict_proba(X_test)[:, positive_index]
+            if pd.Series(y_test).nunique() != 2:
+                raise ValueError("ROC-AUC evaluation requires both target classes in y_test.")
+            metrics['roc_auc'] = float(roc_auc_score(
+                y_test, y_pred_proba, labels=self.pipeline.classes_
+            ))
+        else:
+            metrics['roc_auc'] = float('nan')
         
         return metrics
     
@@ -320,10 +445,21 @@ class PreprocessingPipeline:
         Returns:
             Dict: Cross-validation results
         """
+        if cv < 2:
+            raise ValueError("cv must be at least 2.")
+        target = pd.Series(y)
+        if len(X) != len(target):
+            raise ValueError("X and y must contain the same number of rows.")
+        if target.isna().any():
+            raise ValueError("Target values must not contain missing values.")
+        class_counts = target.value_counts()
+        n_splits = min(cv, int(class_counts.min())) if len(class_counts) >= 2 else 0
+        if n_splits < 2:
+            raise ValueError("Stratified cross-validation requires at least two rows per class.")
         if self.pipeline is None:
             self.create_pipeline()
         
-        cv_splitter = StratifiedKFold(n_splits=cv, shuffle=True, 
+        cv_splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, 
                                      random_state=self.random_state)
         
         # Cross-validation scores
@@ -332,10 +468,10 @@ class PreprocessingPipeline:
         
         self.cv_results = {
             'scores': cv_scores,
-            'mean': cv_scores.mean(),
-            'std': cv_scores.std(),
-            'min': cv_scores.min(),
-            'max': cv_scores.max()
+            'mean': float(cv_scores.mean()),
+            'std': float(cv_scores.std()),
+            'min': float(cv_scores.min()),
+            'max': float(cv_scores.max())
         }
         
         return self.cv_results
@@ -366,7 +502,9 @@ class PreprocessingPipeline:
             self.create_pipeline(**pipeline_config)
             
             # Cross-validate
-            cv_results = self.cross_validate(X, y, cv=5)
+            target = pd.Series(y)
+            fold_count = min(5, int(target.value_counts().min()))
+            cv_results = self.cross_validate(X, y, cv=fold_count)
             
             result = {
                 'config_name': config_name,
@@ -423,12 +561,29 @@ class PreprocessingPipeline:
         if self.pipeline is None:
             self.create_pipeline()
         
+        if train_sizes is not None:
+            train_sizes = np.asarray(train_sizes)
+            if train_sizes.ndim != 1 or train_sizes.size == 0:
+                raise ValueError("train_sizes must be a non-empty one-dimensional array.")
+            if np.any(train_sizes <= 0):
+                raise ValueError("train_sizes values must be greater than zero.")
+        target = pd.Series(y)
+        if len(target) != len(X):
+            raise ValueError("X and y must contain the same number of rows.")
+        if target.isna().any() or len(target.value_counts()) < 2:
+            raise ValueError("Learning curves require valid labels from at least two classes.")
+        n_splits = min(5, int(target.value_counts().min()))
+        if n_splits < 2:
+            raise ValueError("Each class must contain at least two rows for learning curves.")
         if train_sizes is None:
             train_sizes = np.linspace(0.1, 1.0, 10)
         
         train_sizes_abs, train_scores, val_scores = learning_curve(
             self.pipeline, X, y, train_sizes=train_sizes,
-            cv=5, scoring='accuracy', n_jobs=-1, random_state=self.random_state
+            cv=StratifiedKFold(
+                n_splits=n_splits, shuffle=True, random_state=self.random_state
+            ),
+            scoring='accuracy', n_jobs=-1,
         )
         
         return {
@@ -446,7 +601,7 @@ class PreprocessingPipeline:
         Parameters:
             filepath (str): Path to save the pipeline
         """
-        if self.pipeline is None:
+        if self.pipeline is None or not hasattr(self.pipeline, 'classes_'):
             raise ValueError("No pipeline to save. Create and fit a pipeline first.")
         
         joblib.dump(self.pipeline, filepath)
@@ -666,6 +821,15 @@ def create_sample_dataset_with_issues(n_samples: int = 1000,
     Returns:
         Tuple: (X, y) feature matrix and target vector
     """
+    if n_samples < 2:
+        raise ValueError("n_samples must be at least 2.")
+    if n_features < 3:
+        raise ValueError("n_features must be at least 3.")
+    if not np.isfinite(missing_rate) or not 0 <= missing_rate <= 1:
+        raise ValueError("missing_rate must be between 0 and 1.")
+    if not np.isfinite(outlier_rate) or not 0 <= outlier_rate <= 1:
+        raise ValueError("outlier_rate must be between 0 and 1.")
+
     np.random.seed(random_state)
     
     # Create classification dataset
